@@ -189,9 +189,9 @@ Uma.moe is a community resource for Uma Musume Pretty Derby players, providing t
 ## Private simulator forwarding
 
 The existing `/api/` proxy serves the simulator's routes: `POST /api/sim/race`,
-`/api/sim/monte-carlo`, `/api/sim/comparison`, `/api/sim/optimize` and
-`/api/sim/stamina`. `/race` and `/monte-carlo` accept game captures up to 8 MiB; the others
-take 256 KiB. The client's `User-Agent` is forwarded with the request representation
+`/api/sim/monte-carlo`, `/api/sim/batch`, `/api/sim/comparison`, `/api/sim/optimize` and
+`/api/sim/stamina`. `/race` and `/monte-carlo` accept game captures and `/batch` many races,
+up to 8 MiB; the others take 256 KiB. The client's `User-Agent` is forwarded with the request representation
 headers, so the simulator can keep it with archived failures. These routes require exactly
 one granted `X-API-Key`; browser proofs, bearer tokens and cookies do not grant
 simulator access. The backend checks revocation and records usage once, then

@@ -195,13 +195,14 @@ impl Simulator {
     }
 }
 
-/// The simulator's routes. `/race` and `/monte-carlo` accept game captures, which can be
-/// large; the simulator applies the same limits.
+/// The simulator's routes. `/race` and `/monte-carlo` accept game captures and `/batch`
+/// many races, which can be large; the simulator applies the same limits.
 pub fn routes() -> Router<AppState> {
-    let captures = || DefaultBodyLimit::max(8 * 1024 * 1024);
+    let large = || DefaultBodyLimit::max(8 * 1024 * 1024);
     Router::new()
-        .route("/api/sim/race", post(proxy).layer(captures()))
-        .route("/api/sim/monte-carlo", post(proxy).layer(captures()))
+        .route("/api/sim/race", post(proxy).layer(large()))
+        .route("/api/sim/monte-carlo", post(proxy).layer(large()))
+        .route("/api/sim/batch", post(proxy).layer(large()))
         .route("/api/sim/comparison", post(proxy))
         .route("/api/sim/optimize", post(proxy))
         .route("/api/sim/stamina", post(proxy))
@@ -773,6 +774,7 @@ mod tests {
         for path in [
             "/api/sim/race",
             "/api/sim/monte-carlo",
+            "/api/sim/batch",
             "/api/sim/comparison",
             "/api/sim/optimize",
             "/api/sim/stamina",
@@ -786,7 +788,6 @@ mod tests {
             "/api/sim/replay",
             "/api/sim/replay/detailed",
             "/api/sim/races/resimulate",
-            "/api/sim/batch",
             "/api/sim/validate",
         ] {
             let response = app.clone().oneshot(post(path)).await.unwrap();
@@ -900,6 +901,12 @@ mod tests {
             ),
             ("/api/sim/race", 300_000, StatusCode::OK),
             ("/api/sim/monte-carlo", 300_000, StatusCode::OK),
+            ("/api/sim/batch", 300_000, StatusCode::OK),
+            (
+                "/api/sim/batch",
+                8 * 1024 * 1024 + 1,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
             (
                 "/api/sim/race",
                 8 * 1024 * 1024 + 1,
@@ -947,17 +954,17 @@ mod tests {
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            3,
+            4,
             "rejected requests must not reach the simulator"
         );
-        waitForUsage(&db, 3).await;
+        waitForUsage(&db, 4).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT total_requests FROM api_keys WHERE id = $1")
                 .bind(keyId)
                 .fetch_one(&db)
                 .await
                 .unwrap(),
-            3
+            4
         );
         task.abort();
         db.close().await;
