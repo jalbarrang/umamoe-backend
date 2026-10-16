@@ -55,6 +55,11 @@ impl Simulator {
 
         let client = reqwest::Client::builder()
             .no_proxy()
+            // Forward compressed bytes without decoding and re-encoding at this hop.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(120))
@@ -131,9 +136,15 @@ impl Simulator {
     async fn forward(&self, path: &str, headers: &HeaderMap, body: Bytes) -> Response {
         let mut url = self.baseUrl.clone();
         url.set_path(path);
-        // Only forward representation headers; user credentials stay in the backend.
+        // Only forward representation headers and the client's User-Agent, which the
+        // simulator keeps with archived failures; user credentials stay in the backend.
         let mut request = self.client.post(url).body(body);
-        for name in [header::CONTENT_TYPE, header::ACCEPT] {
+        for name in [
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::ACCEPT_ENCODING,
+            header::USER_AGENT,
+        ] {
             for value in headers.get_all(&name) {
                 request = request.header(&name, value);
             }
@@ -162,6 +173,7 @@ impl Simulator {
         for name in [
             header::CONTENT_TYPE,
             header::CONTENT_ENCODING,
+            header::VARY,
             header::RETRY_AFTER,
             header::HeaderName::from_static("server-timing"),
         ] {
@@ -183,20 +195,16 @@ impl Simulator {
     }
 }
 
+/// The simulator's routes. `/race` and `/monte-carlo` accept game captures, which can be
+/// large; the simulator applies the same limits.
 pub fn routes() -> Router<AppState> {
+    let captures = || DefaultBodyLimit::max(8 * 1024 * 1024);
     Router::new()
-        .route("/api/sim/replay", post(proxy))
-        .route("/api/sim/stamina", post(proxy))
-        .route("/api/sim/monte-carlo", post(proxy))
-        .route(
-            "/api/sim/batch",
-            post(proxy).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
-        )
+        .route("/api/sim/race", post(proxy).layer(captures()))
+        .route("/api/sim/monte-carlo", post(proxy).layer(captures()))
+        .route("/api/sim/comparison", post(proxy))
         .route("/api/sim/optimize", post(proxy))
-        .route(
-            "/api/sim/races/resimulate",
-            post(proxy).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
-        )
+        .route("/api/sim/stamina", post(proxy))
         .layer(DefaultBodyLimit::max(256 * 1024))
 }
 
@@ -500,6 +508,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwardingPreservesNegotiatedCompressionWithoutDecoding() {
+        const GZIP: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 4, 255, 171, 86, 42, 42, 205, 43, 86, 178, 50, 172, 5, 0,
+            168, 44, 163, 86, 10, 0, 0, 0,
+        ]; // gzip({"runs":1})
+        let app = Router::new().route(
+            "/sim/monte-carlo",
+            post(|headers: HeaderMap| async move {
+                assert_eq!(headers[header::ACCEPT_ENCODING], "gzip, br");
+                assert_eq!(headers[header::USER_AGENT], "aya/1.4");
+                assert!(!headers.contains_key("x-api-key"));
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/msgpack"),
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::VARY, "Accept-Encoding"),
+                    ],
+                    Bytes::from_static(GZIP),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let simulator = Simulator::new(&format!("http://{address}"), "unused-keys.txt").unwrap();
+        let response = simulator
+            .forward(
+                "/sim/monte-carlo",
+                &HeaderMap::from_iter([
+                    (
+                        header::ACCEPT_ENCODING,
+                        HeaderValue::from_static("gzip, br"),
+                    ),
+                    (header::USER_AGENT, HeaderValue::from_static("aya/1.4")),
+                    (
+                        header::HeaderName::from_static("x-api-key"),
+                        HeaderValue::from_static(API_KEY),
+                    ),
+                ]),
+                Bytes::from_static(b"{}"),
+            )
+            .await;
+        assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(response.headers()[header::VARY], "Accept-Encoding");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            GZIP
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn forwardingStreamsEventsBeforeCompletionWithoutForwardingCredentials() {
         use futures::StreamExt;
         let finish = Arc::new(tokio::sync::Notify::new());
@@ -682,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matchupBatchRequiresAnApiKeyBeforeTouchingTheDatabase() {
+    async fn simulatorRoutesRequireAnApiKeyBeforeTouchingTheDatabase() {
         let db = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .unwrap();
@@ -698,17 +763,35 @@ mod tests {
                 Simulator::new("http://127.0.0.1:1", "unused-keys.txt").unwrap(),
             )),
         };
-        let response = routes()
-            .with_state(state)
-            .oneshot(
-                Request::post("/api/sim/batch")
-                    .header("content-type", "application/json")
-                    .body(Body::from("{\"races\":[]}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let app = routes().with_state(state);
+        let post = |path: &str| {
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        for path in [
+            "/api/sim/race",
+            "/api/sim/monte-carlo",
+            "/api/sim/comparison",
+            "/api/sim/optimize",
+            "/api/sim/stamina",
+        ] {
+            let response = app.clone().oneshot(post(path)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+
+        // The simulator removed these routes; they are not forwarded.
+        for path in [
+            "/api/sim/replay",
+            "/api/sim/replay/detailed",
+            "/api/sim/races/resimulate",
+            "/api/sim/batch",
+            "/api/sim/validate",
+        ] {
+            let response = app.clone().oneshot(post(path)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[tokio::test]
@@ -773,7 +856,7 @@ mod tests {
         };
         let app = routes().with_state(state);
         let request = || {
-            Request::post("/api/sim/replay")
+            Request::post("/api/sim/race")
                 .header("x-api-key", API_KEY)
                 .header("content-type", "application/json")
                 .header("x-simulator-key", "client-forged-service-key")
@@ -801,7 +884,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT requests FROM api_key_usage WHERE endpoint = 'POST /api/sim/replay'"
+                "SELECT requests FROM api_key_usage WHERE endpoint = 'POST /api/sim/race'"
             )
             .fetch_one(&db)
             .await
@@ -811,19 +894,19 @@ mod tests {
 
         for (path, size, expected) in [
             (
-                "/api/sim/replay",
+                "/api/sim/stamina",
                 256 * 1024 + 1,
                 StatusCode::PAYLOAD_TOO_LARGE,
             ),
-            ("/api/sim/races/resimulate", 300_000, StatusCode::OK),
-            ("/api/sim/batch", 300_000, StatusCode::OK),
+            ("/api/sim/race", 300_000, StatusCode::OK),
+            ("/api/sim/monte-carlo", 300_000, StatusCode::OK),
             (
-                "/api/sim/batch",
+                "/api/sim/race",
                 8 * 1024 * 1024 + 1,
                 StatusCode::PAYLOAD_TOO_LARGE,
             ),
             (
-                "/api/sim/races/resimulate",
+                "/api/sim/monte-carlo",
                 8 * 1024 * 1024 + 1,
                 StatusCode::PAYLOAD_TOO_LARGE,
             ),
