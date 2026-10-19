@@ -192,8 +192,8 @@ async fn create_lookup(
 }
 
 /// SSE stream that emits a single completion event for the given task id.
-/// Anonymous lookups return the raw task result (`task_data.result`); logged-in
-/// lookups return the persisted `partner_inheritance` row.
+/// Returns the persisted row when the task result identifies its exact content
+/// hash; otherwise returns the task result (`task_data.result`) itself.
 async fn stream_lookup(
     State(state): State<AppState>,
     Path(task_id): Path<i32>,
@@ -401,8 +401,7 @@ async fn build_completion_event(
         .and_then(|result| result.get("inheritance"))
         .or(task_result);
 
-    // Try to load the persisted partner_inheritance row using the user_id +
-    // resulting account_id stashed in task_data.
+    // A trainer can own multiple runners, so saved rows require an exact content hash.
     let user_id_str = task_data.get("user_id").and_then(|v| v.as_str());
     let account_id = task_inheritance
         .and_then(|r| r.get("account_id"))
@@ -425,30 +424,20 @@ async fn build_completion_event(
     }
 
     if status == "completed" {
-        if let (Some(uid_str), Some(acct)) = (user_id_str, account_id.as_deref()) {
+        if let (Some(uid_str), Some(acct), Some(hash)) =
+            (user_id_str, account_id.as_deref(), content_hash.as_deref())
+        {
             if let Ok(uid) = uuid::Uuid::parse_str(uid_str) {
-                let row = if let Some(hash) = content_hash.as_deref() {
-                    sqlx::query_as::<_, PartnerInheritance>(
-                        "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2 AND content_hash = $3",
-                    )
-                    .bind(uid)
-                    .bind(acct)
-                    .bind(hash)
-                    .fetch_optional(&state.db)
-                    .await
-                    .ok()
-                    .flatten()
-                } else {
-                    sqlx::query_as::<_, PartnerInheritance>(
-                        "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2 ORDER BY updated_at DESC, id DESC LIMIT 1",
-                    )
-                    .bind(uid)
-                    .bind(acct)
-                    .fetch_optional(&state.db)
-                    .await
-                    .ok()
-                    .flatten()
-                };
+                let row = sqlx::query_as::<_, PartnerInheritance>(
+                    "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2 AND content_hash = $3",
+                )
+                .bind(uid)
+                .bind(acct)
+                .bind(hash)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
                 if let Some(r) = row {
                     payload["inheritance"] =
                         serde_json::to_value(&r).unwrap_or(serde_json::Value::Null);
@@ -456,8 +445,7 @@ async fn build_completion_event(
             }
         }
 
-        // Fall back to whatever the bot stashed in task_data.result for anon
-        // (or unpersisted) lookups.
+        // Workers may omit the hash; their task result still identifies the requested runner.
         if payload.get("inheritance").is_none() {
             if let Some(inheritance) = task_inheritance {
                 payload["inheritance"] = inheritance.clone();
@@ -644,8 +632,172 @@ async fn migrate_anon(
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_status, is_anonymous_lookup};
+    use super::{build_completion_event, completion_status, is_anonymous_lookup};
     use crate::models::PartnerLookupRequest;
+
+    #[tokio::test]
+    #[ignore = "requires an isolated local partner_lookup_test database via PARTNER_TEST_DATABASE_URL"]
+    async fn completion_never_substitutes_another_saved_runner() -> anyhow::Result<()> {
+        use axum::response::IntoResponse;
+        use serde_json::{json, Value};
+
+        let database_url = std::env::var("PARTNER_TEST_DATABASE_URL")?;
+        let url = url::Url::parse(&database_url)?;
+        anyhow::ensure!(
+            url.host_str() == Some("127.0.0.1") && url.path() == "/partner_lookup_test",
+            "this regression check requires an isolated local partner_lookup_test database"
+        );
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        sqlx::raw_sql(
+            "CREATE TEMP TABLE users (id UUID PRIMARY KEY); \
+             CREATE TEMP TABLE tasks (id INTEGER PRIMARY KEY, task_data JSONB, error_message TEXT);",
+        )
+        .execute(&db)
+        .await?;
+        let schema = include_str!("../../migrations/20260420000000_add_partner_inheritance.sql")
+            .split("-- ---------------------------------------------------------------------------")
+            .next()
+            .unwrap()
+            .replace("CREATE TABLE IF NOT EXISTS", "CREATE TEMP TABLE");
+        sqlx::raw_sql(&schema).execute(&db).await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260421000000_add_trainer_name_to_partner_inheritance.sql"
+        ))
+        .execute(&db)
+        .await?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/20260704000000_partner_inheritance_content_hash.sql"
+        ))
+        .execute(&db)
+        .await?;
+
+        let user_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id) VALUES ($1)")
+            .bind(user_id)
+            .execute(&db)
+            .await?;
+        let requested: Value = sqlx::query_scalar(
+            "INSERT INTO partner_inheritance (user_id, account_id, main_parent_id, label) \
+             VALUES ($1, '123456789012', 101001, 'Requested runner') RETURNING to_jsonb(partner_inheritance)",
+        )
+        .bind(user_id)
+        .fetch_one(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO partner_inheritance (user_id, account_id, main_parent_id, label, updated_at) \
+             VALUES ($1, '123456789012', 101002, 'Other saved runner', NOW() + INTERVAL '1 day')",
+        )
+        .bind(user_id)
+        .execute(&db)
+        .await?;
+
+        let state = crate::AppState {
+            db: db.clone(),
+            search_client: reqwest::Client::new(),
+            search_url: String::new(),
+            oauth_redirect_base: String::new(),
+            task_notifier: crate::notify::TaskNotifier::new(),
+            redis_store: None,
+            user_writes_disabled: false,
+            simulator: None,
+        };
+        let mut hashless = requested.clone();
+        for key in ["id", "user_id", "content_hash", "created_at", "updated_at"] {
+            hashless.as_object_mut().unwrap().remove(key);
+        }
+        let mut unknown_hash = hashless.clone();
+        unknown_hash["content_hash"] = json!("not-saved");
+        let mut unsaved = hashless.clone();
+        unsaved["main_parent_id"] = json!(101003);
+
+        for (user, result, status, expected) in [
+            (
+                json!(user_id),
+                hashless.clone(),
+                "completed",
+                Some(hashless.clone()),
+            ),
+            (
+                json!(user_id),
+                json!({ "inheritance": hashless }),
+                "completed",
+                Some(hashless.clone()),
+            ),
+            (
+                json!(user_id),
+                requested.clone(),
+                "completed",
+                Some(requested.clone()),
+            ),
+            (
+                json!(user_id),
+                json!({ "inheritance": requested }),
+                "completed",
+                Some(requested.clone()),
+            ),
+            (
+                json!(user_id),
+                unknown_hash.clone(),
+                "completed",
+                Some(unknown_hash),
+            ),
+            (json!(user_id), unsaved.clone(), "completed", Some(unsaved)),
+            (
+                Value::Null,
+                hashless.clone(),
+                "completed",
+                Some(hashless.clone()),
+            ),
+            (json!(user_id), hashless.clone(), "failed", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO tasks (id, task_data, error_message) VALUES (7, $1, $2) \
+                 ON CONFLICT (id) DO UPDATE SET task_data = EXCLUDED.task_data, error_message = EXCLUDED.error_message",
+            )
+            .bind(json!({ "partner_id": "974977409", "user_id": user, "result": result }))
+            .bind((status == "failed").then_some("Saved partner list is full"))
+            .execute(&db)
+            .await?;
+
+            let built = build_completion_event(&state, 7, status).await;
+            assert_eq!(built.anonymous, user.is_null());
+            let response = super::Sse::new(futures::stream::iter([Ok::<
+                _,
+                std::convert::Infallible,
+            >(built.event)]))
+            .into_response();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+            let body = std::str::from_utf8(&body)?;
+            assert!(body.contains(&format!("event: {status}\n")), "{body}");
+            let data = body
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let payload: Value = serde_json::from_str(data)?;
+            assert_eq!(payload["task_id"], 7);
+            assert_eq!(payload["status"], status);
+            if let Some(mut expected) = expected {
+                expected.as_object_mut().unwrap().remove("user_id");
+                // Saved timestamps are serialized as UTC; raw task timestamps are preserved.
+                for key in ["created_at", "updated_at"] {
+                    expected.as_object_mut().unwrap().remove(key);
+                }
+                let mut actual = payload["inheritance"].clone();
+                for key in ["created_at", "updated_at"] {
+                    actual.as_object_mut().unwrap().remove(key);
+                }
+                assert_eq!(actual, expected);
+            } else {
+                assert!(payload.get("inheritance").is_none());
+                assert_eq!(payload["error"], "Saved partner list is full");
+            }
+        }
+        db.close().await;
+        Ok(())
+    }
 
     #[test]
     fn persistence_requirement_is_backwards_compatible_and_explicit() {
